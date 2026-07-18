@@ -1,0 +1,22 @@
+# 音声ファイル・出力結果（個人情報を含む可能性があるため除外）
+input/*
+output/*
+!input/.gitkeep
+!output/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# エディタ・OS
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# APIキー等の秘密情報
+.env
+*.key
