@@ -24,6 +24,19 @@ WATCHER_LOG = os.path.join(BASE, "watcher.log")
 CREATE_NO_WINDOW = 0x08000000  # 起動する bot に黒い窓を出さないフラグ
 
 
+def notify(title, message):
+    """画面にポップアップ（メッセージボックス）を出す。見張り役をブロックしないよう別プロセスで表示。"""
+    # 0x40=情報アイコン, 0x1000=最前面表示, 0x10000=最前面ウィンドウとして表示
+    code = (
+        "import ctypes;"
+        f"ctypes.windll.user32.MessageBoxW(0, {message!r}, {title!r}, 0x40 | 0x1000)"
+    )
+    try:
+        subprocess.Popen([PYTHON, "-c", code], creationflags=CREATE_NO_WINDOW)
+    except Exception as e:
+        wlog(f"通知の表示に失敗: {e}")
+
+
 def wlog(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -71,6 +84,7 @@ def start_bot():
             cwd=BASE, stdout=out_f, stderr=err_f,
             creationflags=CREATE_NO_WINDOW,
         )
+        notify("議事録bot", "🎙️ 議事録botが起動しました。\nDiscordで /record が使えます。")
     except Exception as e:
         wlog(f"bot起動に失敗: {e}")
 
@@ -98,6 +112,7 @@ def main():
         elif (not d) and pids:
             wlog("Discord終了 → bot を停止します")
             stop_bots(pids)
+            notify("議事録bot", "⏹️ 議事録botが終了しました。")
 
         time.sleep(7)
 
