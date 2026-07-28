@@ -4,6 +4,9 @@ output/*
 !input/.gitkeep
 !output/.gitkeep
 
+# Discord録音bot の録音・議事録データ（個人情報を含むため除外）
+recordings/
+
 # Python
 __pycache__/
 *.pyc

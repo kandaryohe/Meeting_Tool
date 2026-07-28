@@ -1,0 +1,9 @@
+# Discord録音bot 用の依存パッケージ
+# インストール: py -3.13 -m pip install -r requirements-bot.txt
+#
+# ※ 音声録音ライブラリ(Pycord)は Python 3.13 で動作確認しています。
+#    Python 3.14 は対応が不十分なため 3.13 を使ってください。
+
+py-cord[voice]>=2.6.1   # Discord bot 本体 + 音声送受信(録音)機能
+audioop-lts             # Python 3.13以降で削除された audioop の代替（Pycord音声処理に必須）
+python-dotenv           # .env からトークン等を読み込む
