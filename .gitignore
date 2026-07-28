@@ -7,6 +7,9 @@ output/*
 # Discord録音bot の録音・議事録データ（個人情報を含むため除外）
 recordings/
 
+# ログ（議事録の中身が含まれる可能性があるため除外）
+*.log
+
 # Python
 __pycache__/
 *.pyc
