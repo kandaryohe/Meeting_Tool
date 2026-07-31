@@ -38,8 +38,7 @@ Discord bot が通話に参加して録音し、**停止した瞬間に自動で
 ### 1. Discord bot を用意する
 1. https://discord.com/developers/applications → **New Application**
 2. 左メニュー **Bot** → **Reset Token** でトークンを取得（後で `.env` に貼る）
-3. 同じ Bot 画面で **MESSAGE CONTENT INTENT** を ON
-4. 左メニュー **OAuth2 → URL Generator**
+3. 左メニュー **OAuth2 → URL Generator**
    - SCOPES: `bot` と `applications.commands`
    - BOT PERMISSIONS: `Connect` / `Speak` / `Use Voice Activity` / `Send Messages` / `Attach Files`
    - 生成 URL を開き、**自分のサーバーに招待**
@@ -53,6 +52,10 @@ Discord bot が通話に参加して録音し、**停止した瞬間に自動で
 DISCORD_TOKEN=（Discordのbotトークン）
 GEMINI_API_KEY=（GeminiのAPIキー）
 ```
+
+> 以下は任意設定です（未設定でも動きます）:
+> - `DELETE_AUDIO_AFTER_PROCESSING` … 議事録作成成功後、生の音声ファイルを自動削除するか（既定: `true`）。書き起こし・議事録は残ります。
+> - `RECORDINGS_RETENTION_DAYS` … `recordings/` 内の古い会議フォルダを bot 起動時に自動削除するまでの日数（既定: `30`。0以下で無効化）。
 
 ### 4. 依存パッケージ（すでに導入済みなら不要）
 ```powershell

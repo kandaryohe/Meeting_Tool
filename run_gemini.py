@@ -3,6 +3,14 @@ import sys
 import glob
 import google.generativeai as genai
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # 同じフォルダの .env を読み込む（GEMINI_API_KEY など）
+except Exception:
+    pass  # python-dotenv が無くても環境変数が直接設定されていれば動く
+
+from gemini_utils import generate_with_retry
+
 # ======================================================================
 # 【設定】使用するAIモデルの指定
 # ======================================================================
@@ -72,11 +80,11 @@ if __name__ == "__main__":
             continue
 
         try:
-            response = gemini_model.generate_content(transcribed_text)
+            response = generate_with_retry(gemini_model, transcribed_text)
             with open(summary_path, "w", encoding="utf-8") as f:
                 f.write(response.text)
             print(f"  -> ✓ 保存完了: {os.path.basename(summary_path)}")
         except Exception as e:
-            print(f"  -> エラーが発生しました: {e}")
+            print(f"  -> エラーが発生しました（リトライ済み）: {e}")
 
     print("要約処理がすべて完了しました。")

@@ -29,6 +29,10 @@ except Exception:
     pass  # python-dotenv が無くても環境変数が直接設定されていれば動く
 
 
+from whisper_utils import load_whisper_pipeline, transcribe_segments, format_timestamp
+from gemini_utils import generate_with_retry
+
+
 def _ensure_ffmpeg_on_path():
     """
     transformers の音声読み込みは ffmpeg を使う。
@@ -68,76 +72,6 @@ SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".mp4", ".flac"}
 GEMINI_MODEL_NAME = "gemini-2.5-pro"
 
 
-# ======================================================================
-#  文字起こし（Whisper）
-# ======================================================================
-def load_whisper_pipeline():
-    """kotoba-whisper のパイプラインを初期化して返す（重いので1回だけ呼ぶ）。"""
-    import torch
-    from transformers import pipeline
-
-    model_id = "kotoba-tech/kotoba-whisper-v2.2"
-
-    device = "cpu"
-    torch_dtype = torch.float32
-    if torch.cuda.is_available():
-        device = "cuda:0"
-        torch_dtype = torch.float16
-        print("★ NVIDIA GPU (CUDA) を使用します")
-    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        device = "mps"
-        torch_dtype = torch.float16
-        print("★ Apple Silicon GPU (MPS) を使用します")
-    else:
-        print("★ CPU を使用します（処理に時間がかかります）")
-
-    print(f"モデル {model_id} をロード中...（初回はダウンロードがあり時間がかかります）")
-    pipe = pipeline(
-        "automatic-speech-recognition",
-        model=model_id,
-        torch_dtype=torch_dtype,
-        device=device,
-        chunk_length_s=30,
-        batch_size=8,
-    )
-    return pipe
-
-
-def transcribe_segments(pipe, file_path):
-    """
-    1つの音声ファイルを文字起こしし、タイムスタンプ付きセグメントの一覧を返す。
-    返り値: [(start_sec, end_sec, text), ...]
-    """
-    result = pipe(file_path, return_timestamps=True)
-
-    segments = []
-    for chunk in result.get("chunks", []):
-        text = (chunk.get("text") or "").strip()
-        if not text:
-            continue
-        ts = chunk.get("timestamp") or (None, None)
-        start = ts[0] if ts[0] is not None else 0.0
-        end = ts[1] if len(ts) > 1 and ts[1] is not None else start
-        segments.append((float(start), float(end), text))
-
-    # chunks が空でも text があれば1セグメントとして扱う（保険）
-    if not segments:
-        text = (result.get("text") or "").strip()
-        if text:
-            segments.append((0.0, 0.0, text))
-
-    return segments
-
-
-def _fmt_time(seconds):
-    """秒 -> [HH:MM:SS] 形式の文字列。"""
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
 def build_transcript(meeting_dir):
     """
     会議フォルダ内の全音声トラックを文字起こしし、
@@ -171,7 +105,7 @@ def build_transcript(meeting_dir):
     # 発言開始時刻でソート（＝会話の流れの順番に並ぶ）
     all_segments.sort(key=lambda x: x[0])
 
-    lines = [f"[{_fmt_time(start)}] {speaker}: {text}"
+    lines = [f"[{format_timestamp(start)}] {speaker}: {text}"
              for start, end, speaker, text in all_segments]
     return "\n".join(lines)
 
@@ -207,10 +141,10 @@ def summarize_with_gemini(transcript_text):
 
     print(f"★ Gemini ({GEMINI_MODEL_NAME}) で議事録を作成中...")
     try:
-        response = model.generate_content(transcript_text)
+        response = generate_with_retry(model, transcript_text)
         return response.text
     except Exception as e:
-        print(f"警告: 要約中にエラーが発生しました: {e}")
+        print(f"警告: 要約中にエラーが発生しました（リトライ済み）: {e}")
         return None
 
 

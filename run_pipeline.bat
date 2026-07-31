@@ -8,13 +8,13 @@ echo 一括パイプライン処理を開始します
 echo ========================================
 
 :: ==========================================
-:: 1. 環境変数の設定 (APIキー)
+:: 1. .env の存在確認 (APIキー)
 :: ==========================================
-:: ★ ここに取得した Gemini API キーを貼り付けてください
-set GEMINI_API_KEY=YOUR_API_KEY_HERE
-
-if "%GEMINI_API_KEY%"=="YOUR_API_KEY_HERE" (
-    echo [エラー] バッチファイルをテキストエディタで開き、GEMINI_API_KEY を設定してください。
+:: GEMINI_API_KEY はここには書かず、.env から run_gemini.py が読み込みます
+:: （バッチファイルに直書きすると誤ってGitにコミットされる恐れがあるため）
+if not exist ".env" (
+    echo [エラー] ".env" が見つかりません。
+    echo ".env.example" を ".env" にコピーし、GEMINI_API_KEY を設定してください。
     pause
     exit /b 1
 )
