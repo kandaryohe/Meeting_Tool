@@ -14,6 +14,8 @@ import time
 import subprocess
 from datetime import datetime
 
+import psutil
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 PYTHON = os.path.join(BASE, ".venv", "Scripts", "python.exe")
 BOT = os.path.join(BASE, "discord_bot.py")
@@ -48,31 +50,29 @@ def wlog(msg):
 
 def discord_running():
     """このPCで Discord.exe が起動しているか。"""
-    try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq Discord.exe", "/NH"],
-            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
-        ).stdout
-        return "Discord.exe" in out
-    except Exception:
-        return False
+    for p in psutil.process_iter(["name"]):
+        try:
+            if (p.info.get("name") or "").lower() == "discord.exe":
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return False
 
 
 def get_bot_pids():
     """discord_bot.py を実行中の python プロセスのPID一覧を返す（重複起動防止）。"""
-    ps_cmd = (
-        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-        "Where-Object { $_.CommandLine -like '*discord_bot.py*' } | "
-        "Select-Object -ExpandProperty ProcessId"
-    )
-    try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
-        ).stdout
-        return [int(x) for x in out.split() if x.strip().isdigit()]
-    except Exception:
-        return []
+    pids = []
+    for p in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = (p.info.get("name") or "").lower()
+            if name not in ("python.exe", "pythonw.exe"):
+                continue
+            cmdline = p.info.get("cmdline") or []
+            if any("discord_bot.py" in arg for arg in cmdline):
+                pids.append(p.info["pid"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return pids
 
 
 def start_bot():
@@ -92,9 +92,9 @@ def start_bot():
 def stop_bots(pids):
     for pid in pids:
         try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                           creationflags=CREATE_NO_WINDOW,
-                           capture_output=True)
+            psutil.Process(pid).terminate()
+        except psutil.NoSuchProcess:
+            pass
         except Exception as e:
             wlog(f"bot停止に失敗(PID {pid}): {e}")
 

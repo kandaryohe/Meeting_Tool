@@ -18,15 +18,17 @@ Discord 議事録作成bot
 """
 
 import os
-import re
 import sys
 import asyncio
 import datetime
+import shutil
 import subprocess
 from pathlib import Path
 
 import discord
 from dotenv import load_dotenv
+
+from text_utils import sanitize_filename
 
 # ----------------------------------------------------------------------
 # 設定の読み込み
@@ -44,6 +46,16 @@ if not TOKEN or TOKEN.startswith("ここに"):
 # 録音ファイルの保存先（会議ごとにサブフォルダを作る）
 REC_DIR = BASE_DIR / "recordings"
 REC_DIR.mkdir(exist_ok=True)
+
+# 議事録作成に成功したら、容量削減のため生の音声ファイルを削除するか
+_DELETE_AUDIO_ENV = os.environ.get("DELETE_AUDIO_AFTER_PROCESSING", "true").strip().lower()
+DELETE_AUDIO_AFTER_PROCESSING = _DELETE_AUDIO_ENV not in ("false", "0", "no")
+
+# この日数より古い録音フォルダは起動時に自動削除する（0以下で無効化）
+try:
+    RECORDINGS_RETENTION_DAYS = int(os.environ.get("RECORDINGS_RETENTION_DAYS", "30") or "30")
+except ValueError:
+    RECORDINGS_RETENTION_DAYS = 30
 
 # 文字起こし＋要約パイプライン
 PIPELINE_PY = BASE_DIR / "pipeline.py"
@@ -71,10 +83,30 @@ bot = discord.Bot(intents=intents, debug_guilds=_debug_guilds)
 connections = {}
 
 
-def _sanitize(name: str) -> str:
-    """ファイル名に使えない文字を除去する。"""
-    name = re.sub(r'[\\/:*?"<>|]', "_", name).strip()
-    return name or "unknown"
+def _cleanup_old_recordings():
+    """RECORDINGS_RETENTION_DAYS より古い録音フォルダを削除する（容量対策）。"""
+    if RECORDINGS_RETENTION_DAYS <= 0:
+        return
+    cutoff = datetime.datetime.now().timestamp() - RECORDINGS_RETENTION_DAYS * 86400
+    for entry in REC_DIR.iterdir():
+        if not entry.is_dir():
+            continue
+        try:
+            if entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry)
+                print(f"古い録音フォルダを削除しました（{RECORDINGS_RETENTION_DAYS}日超過）: {entry.name}")
+        except Exception as e:
+            print(f"録音フォルダの削除に失敗 ({entry.name}): {e}")
+
+
+def _delete_audio_files(meeting_dir: Path):
+    """議事録作成に成功した後、生の音声ファイルを削除する（書き起こし・議事録は残す）。"""
+    for pattern in ("*.wav", "*.mp3", "*.m4a", "*.mp4", "*.flac"):
+        for f in meeting_dir.glob(pattern):
+            try:
+                f.unlink()
+            except Exception as e:
+                print(f"音声ファイルの削除に失敗 ({f.name}): {e}")
 
 
 @bot.event
@@ -83,6 +115,7 @@ async def on_ready():
     print(f"ログイン成功: {bot.user}  (bot準備完了)")
     print("Discordで /record を実行すると録音を開始します。")
     print("=" * 50)
+    _cleanup_old_recordings()
 
 
 @bot.slash_command(description="今いるボイスチャンネルの録音を開始します")
@@ -171,7 +204,7 @@ async def on_recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
             if user is not None:
                 display = user.display_name
 
-        out_path = meeting_dir / f"{_sanitize(display)}.wav"
+        out_path = meeting_dir / f"{sanitize_filename(display)}.wav"
         try:
             audio.file.seek(0)
             with open(out_path, "wb") as f:
@@ -203,6 +236,9 @@ async def on_recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
             )
         except Exception as e:
             await channel.send(f"議事録は作成できましたが、投稿に失敗しました: {e}\n保存先: {result_path}")
+
+        if DELETE_AUDIO_AFTER_PROCESSING:
+            _delete_audio_files(meeting_dir)
     else:
         tail = (stderr or "").strip().splitlines()[-5:]
         detail = "\n".join(tail) if tail else "（詳細不明）"

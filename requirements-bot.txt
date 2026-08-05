@@ -7,3 +7,4 @@
 py-cord[voice]>=2.6.1   # Discord bot 本体 + 音声送受信(録音)機能
 audioop-lts             # Python 3.13以降で削除された audioop の代替（Pycord音声処理に必須）
 python-dotenv           # .env からトークン等を読み込む
+psutil                  # watch_discord.py のプロセス監視（自動起動ウォッチャー）用
