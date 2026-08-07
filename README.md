@@ -14,6 +14,7 @@ Discord bot が通話に参加して録音し、**停止した瞬間に自動で
 までを行います。
 
 音声ファイルを手元に持っている場合は、bot を使わず手動で処理することもできます（下記「手動モード」）。
+Google Meet などDiscord以外のツールで録音した音声も、手動モードで議事録化できます（話者分離を有効にすれば発言者ごとの区別も可能）。
 
 ---
 
@@ -23,8 +24,9 @@ Discord bot が通話に参加して録音し、**停止した瞬間に自動で
 |---|---|---|
 | `discord_bot.py` | Discord録音bot本体（録音→保存→パイプライン起動） | `.venv`（Python 3.13） |
 | `pipeline.py` | 文字起こし＋議事録作成（bot から呼ばれる） | Python 3.14（torch入り） |
-| `run_whisper.py` | 手動：`input/` の音声を文字起こし | Python 3.14 |
+| `run_whisper.py` | 手動：`input/` の音声を文字起こし（話者分離オプション対応） | Python 3.14 |
 | `run_gemini.py` | 手動：`output/` のテキストを要約 | Python 3.14 |
+| `diarize_utils.py` | 話者分離（pyannote.audio）のヘルパー。1本の音声から発言者を推定する | Python 3.14 |
 | `prompt.txt` | 議事録の書式・要約方針を指示するプロンプト | － |
 | `議事録bot起動.bat` | bot をワンクリック起動 | － |
 
@@ -66,6 +68,9 @@ py -3.13 -m venv .venv
 # 文字起こし・要約用（Python 3.14）
 py -3.14 -m pip install torch transformers google-generativeai python-dotenv
 
+# （任意）話者分離を使う場合。Meet等、1本の音声に複数人の声が混ざっている場合に有効化する
+py -3.14 -m pip install pyannote.audio
+
 # ffmpeg（音声処理）
 winget install Gyan.FFmpeg
 ```
@@ -93,6 +98,24 @@ Discord を使わず、手元の音声ファイルから議事録を作る場合
 2. `run_pipeline.bat` を実行（`GEMINI_API_KEY` の設定が必要）
    - 文字起こしのみなら `文字起こし.bat`（音声をドラッグ＆ドロップでもOK）
 
+Google Meet 等の商談・打ち合わせを録音した音声（自分と相手の声が1本にミックスされたファイル）にも使えます。
+録音は OBS Studio 等でPCの「マイク＋スピーカー出力」をまとめて1ファイルに保存してください。
+相手の発言（依頼されたタスク等）を録音・AI処理する旨は、事前に相手へ一言伝えておくことを推奨します。
+
+### 話者分離（誰が話したか）を有効にする
+
+デフォルトでは1本の音声から「誰が話したか」は区別できません。区別したい場合は以下を設定してください。
+
+1. https://huggingface.co/pyannote/speaker-diarization-3.1 を開き、利用規約に同意（Hugging Face アカウントが必要）
+2. https://huggingface.co/settings/tokens でアクセストークンを発行
+3. `.env` の `HF_TOKEN` に貼り付け
+4. `py -3.14 -m pip install pyannote.audio` を実行
+
+設定済みの状態で `run_whisper.py`（＝`run_pipeline.bat` / `文字起こし.bat`）を実行すると、
+書き起こしが `[時刻] 話者1: ...` のように発言者ラベル付きになり、`prompt.txt` の設定により
+議事録内でも発言者ごとに整理されます（本人が名乗っていれば実名に、そうでなければ「話者1」等のまま）。
+`HF_TOKEN` が未設定の場合は自動的にスキップされ、従来通りの動作になります。
+
 ---
 
 ## トラブルシューティング
@@ -101,3 +124,5 @@ Discord を使わず、手元の音声ファイルから議事録を作る場合
 - **「ffmpegが見つかりません」** … `winget install Gyan.FFmpeg` 実行後、PCまたは端末を再起動。
 - **議事録が作られず書き起こしだけできる** … `.env` の `GEMINI_API_KEY` が未設定です。
 - **文字起こしが遅い** … GPUが無いためCPU処理になっています。短い会議で試すか、GPU環境の利用を検討してください。
+- **話者分離で 401/403 エラーになる** … `pyannote/speaker-diarization-3.1` の利用規約に同意していないか、`HF_TOKEN` が間違っています。Hugging Face 上でモデルページを開き、同意した上でトークンを再発行してください。
+- **話者分離が効いていない（発言者ラベルが付かない）** … `.env` の `HF_TOKEN` が空、または `pyannote.audio` が未インストールです。起動時ログに「話者分離は無効です」と出ていないか確認してください。

@@ -1,10 +1,32 @@
 import sys
 import os
 
-from whisper_utils import load_whisper_pipeline, transcribe_file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # 同じフォルダの .env を読み込む（HF_TOKEN など）
+except Exception:
+    pass  # python-dotenv が無くても環境変数が直接設定されていれば動く
+
+from whisper_utils import load_whisper_pipeline, transcribe_file, transcribe_segments, format_timestamp
+import diarize_utils
 
 # 処理対象とする拡張子のリスト
 SUPPORTED_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.mp4', '.flac'}
+
+
+def _build_labeled_transcript(whisper_pipe, diarization_pipe, file_path):
+    """
+    1本の音声ファイル（Meet等の録音のように全員の声が混ざっている想定）を
+    文字起こし＋話者分離し、「[時刻] 話者N: 発言」形式のテキストを返す。
+    """
+    diar_segments = diarize_utils.diarize(diarization_pipe, file_path)
+
+    lines = []
+    for start, end, text in transcribe_segments(whisper_pipe, file_path):
+        speaker = diarize_utils.assign_speaker(diar_segments, start, end)
+        lines.append(f"[{format_timestamp(start)}] {speaker}: {text}")
+    return "\n".join(lines)
+
 
 if __name__ == "__main__":
     # ディレクトリの設定
@@ -36,11 +58,19 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print(f"合計 {len(target_files)} 件のファイルを処理します。")
+
+    use_diarization = diarize_utils.is_available()
+    if use_diarization:
+        print("★ 話者分離(speaker diarization)が有効です。発言ごとに話者を推定して書き起こします。")
+    else:
+        print("話者分離は無効です（HF_TOKEN未設定、または pyannote.audio 未導入）。")
+        print("Google Meet等、1本の音声に複数人の声が混ざっている場合は README を参照して有効化してください。")
     print("-" * 30)
 
     try:
         # 1. モデルロード (ループの外で1回だけ実行)
         pipe = load_whisper_pipeline()
+        diarization_pipe = diarize_utils.load_diarization_pipeline() if use_diarization else None
         print("-" * 30)
 
         # 2. 各ファイルを順次処理
@@ -49,7 +79,10 @@ if __name__ == "__main__":
 
             try:
                 # 文字起こし実行
-                text = transcribe_file(pipe, input_path)
+                if diarization_pipe is not None:
+                    text = _build_labeled_transcript(pipe, diarization_pipe, input_path)
+                else:
+                    text = transcribe_file(pipe, input_path)
 
                 # 出力ファイル名の生成 (input/sample.mp3 -> output/sample.txt)
                 file_base_name = os.path.splitext(filename)[0]
