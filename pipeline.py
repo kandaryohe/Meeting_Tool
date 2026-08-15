@@ -68,8 +68,14 @@ def _ensure_ffmpeg_on_path():
 # 対応する音声拡張子
 SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".mp4", ".flac"}
 
-# 要約に使う Gemini モデル
-GEMINI_MODEL_NAME = "gemini-2.5-pro"
+# 要約に使う Gemini モデル。
+# バージョンを固定すると提供終了時に 404 で議事録が作れなくなるため
+# （実際に gemini-2.5-pro が "no longer available" になった）、
+# 最新版を追従するエイリアスを使う。
+#
+# gemini-pro-latest は無料枠だとクォータ超過(429)になるため flash を既定にする。
+# 品質を上げたい場合は .env に GEMINI_MODEL=gemini-pro-latest を設定する（有料枠が必要）。
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 
 def build_transcript(meeting_dir):

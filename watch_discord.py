@@ -84,7 +84,7 @@ def start_bot():
             cwd=BASE, stdout=out_f, stderr=err_f,
             creationflags=CREATE_NO_WINDOW,
         )
-        notify("議事録bot", "🎙️ 議事録botが起動しました。\nDiscordで /record が使えます。")
+        notify("議事録bot", "🎙️ 議事録botが起動しました。\n録音開始ボタン（または /record）が使えます。")
     except Exception as e:
         wlog(f"bot起動に失敗: {e}")
 

@@ -3,22 +3,37 @@
 Discord 議事録作成bot
 
 やること:
-  1. ボイスチャンネルに参加して録音（話者ごとに別トラック）
-  2. /stop で停止した瞬間に音声を recordings/<会議名>/ に自動保存
+  1. ボタン（または /record）でボイスチャンネルの録音を開始（話者ごとに別トラック）
+  2. 停止した瞬間に音声を recordings/<会議名>/ に自動保存
   3. そのまま文字起こし→議事録作成のパイプラインを自動実行
   4. できあがった議事録を Discord のテキストチャンネルに投稿
 
-コマンド（スラッシュコマンド）:
-  /record … 自分が今いるボイスチャンネルの録音を開始
-  /stop   … 録音を停止し、議事録作成を開始
+⚠️ 会議は必ず「ステージチャンネル」で行うこと。
+   Discord は 2026-03-02 に DAVE(E2E暗号化) を必須化したため、通常の
+   ボイスチャンネルには DAVE 非対応の bot は接続できない（4017）。
+   ステージチャンネルはこの必須化の対象外なので、そこでなら録音できる。
+
+操作方法:
+  /panel  … 「録音開始」「停止して議事録作成」ボタン付きのパネルを設置する（推奨）
+  /record … 録音開始（ボタンと同じ）
+  /stop   … 停止＆議事録作成（ボタンと同じ）
   /status … 現在の録音状態を確認
+  /leave  … 状態がおかしくなったときの強制退出（復旧用）
+
+パネルは一度設置すればbotを再起動しても押せます（永続View）。
+
+必要なライブラリ:
+  py-cord 2.7.2。上げても下げても録音できない。
+  詳細は requirements-bot.txt のコメントを参照。
 
 起動:
-  .venv（Python 3.13）で実行してください。通常は「議事録bot起動.bat」から起動します。
+  .venv（Python 3.13）で実行してください。通常はウォッチャーが自動起動します。
 """
 
 import os
 import sys
+import wave
+import struct
 import asyncio
 import datetime
 import shutil
@@ -67,6 +82,9 @@ if _pipeline_python_env:
 else:
     PIPELINE_CMD_PREFIX = ["py", "-3.14"]
 
+# 録音トラックがこのバイト数未満なら「実質無音」とみなす（WAVヘッダのみ等）
+MIN_TRACK_BYTES = 8000
+
 # ----------------------------------------------------------------------
 # bot 本体
 # ----------------------------------------------------------------------
@@ -109,81 +127,274 @@ def _delete_audio_files(meeting_dir: Path):
                 print(f"音声ファイルの削除に失敗 ({f.name}): {e}")
 
 
-@bot.event
-async def on_ready():
-    print("=" * 50)
-    print(f"ログイン成功: {bot.user}  (bot準備完了)")
-    print("Discordで /record を実行すると録音を開始します。")
-    print("=" * 50)
-    _cleanup_old_recordings()
+async def _wait_connected(vc: discord.VoiceClient, timeout: float = 15.0) -> bool:
+    """音声接続の確立を待つ。
+
+    connect() から戻った直後はまだハンドシェイクが終わっておらず、
+    そのまま start_recording すると「Not connected to voice channel」で落ちる。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if vc.is_connected():
+            return True
+        await asyncio.sleep(0.5)
+    return vc.is_connected()
 
 
-@bot.slash_command(description="今いるボイスチャンネルの録音を開始します")
-async def record(ctx: discord.ApplicationContext):
-    # ボイスチャンネルに入っているか確認
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        await ctx.respond("先にボイスチャンネルに参加してから /record を実行してください。", ephemeral=True)
+async def _force_disconnect(vc) -> None:
+    """例外を無視して確実にボイスチャンネルから抜ける。"""
+    if vc is None:
         return
-
-    if ctx.guild.id in connections:
-        await ctx.respond("すでに録音中です。停止するには /stop を使ってください。", ephemeral=True)
-        return
-
-    channel = ctx.author.voice.channel
     try:
-        vc = await channel.connect()
+        await vc.disconnect(force=True)
     except Exception as e:
-        await ctx.respond(f"ボイスチャンネルへの接続に失敗しました: {e}", ephemeral=True)
-        return
+        print(f"切断時のエラー(無視): {e}")
+
+
+def _extract_pcm(raw: bytes):
+    """py-cord が返すバイト列から PCM 本体と音声形式を取り出す。
+
+    py-cord の WaveSink.format_audio は wave.open() でヘッダを書くだけで
+    writeframes を呼ばないため、data チャンクのサイズが 0 の壊れた WAV に
+    なる（RIFFサイズも36のまま）。ffmpeg は寛容なので読めてしまうが、
+    Python の wave モジュールは「0秒」と判定する。
+    そこでヘッダを捨てて PCM だけを取り出し、正しい WAV として書き直す。
+
+    返り値: (PCMバイト列, チャンネル数, サンプル幅バイト, サンプリングレート)
+    """
+    channels, width, rate = 2, 2, 48000  # Opusデコーダの既定値
+
+    if raw[:4] == b"RIFF":
+        i = raw.find(b"fmt ")
+        if i != -1 and len(raw) >= i + 24:
+            try:
+                channels = struct.unpack("<H", raw[i + 10:i + 12])[0] or channels
+                rate = struct.unpack("<I", raw[i + 12:i + 16])[0] or rate
+                bits = struct.unpack("<H", raw[i + 22:i + 24])[0] or 16
+                width = bits // 8
+            except struct.error:
+                pass
+        j = raw.find(b"data")
+        if j != -1:
+            return raw[j + 8:], channels, width, rate
+
+    return raw, channels, width, rate
+
+
+def _explain_voice_error(e: Exception) -> str:
+    """ボイス接続の失敗コードに、原因と対処の説明を付ける。
+
+    Discord は 2026-03-02 に DAVE(E2E暗号化) を必須化した。
+    DAVE 非対応のクライアントは通常のボイスチャンネルに入れない。
+    ただし「ステージチャンネル」はこの必須化の対象外なので、
+    そちらを使えば録音できる。
+    """
+    msg = str(e)
+    if "4017" in msg:
+        return (
+            "\n\n**原因**: このチャンネルは DAVE(E2E暗号化) 対応を必須にしています。"
+            "Discordが2026年3月から通常のボイスチャンネルで必須化したもので、"
+            "botのライブラリ(py-cord)がまだ対応できていません。\n"
+            "**対処**: 会議を **ステージチャンネル** で行ってください。"
+            "ステージチャンネルはこの必須化の対象外です。"
+        )
+    if "4006" in msg:
+        return (
+            "\n\n**原因**: ボイスゲートウェイのセッションが無効です。"
+            "py-cord のバージョンが古すぎる可能性があります（2.7.2 が必要）。"
+        )
+    if "4014" in msg:
+        return "\n\n**原因**: botにこのチャンネルへの接続権限がありません。"
+    return ""
+
+
+# ----------------------------------------------------------------------
+# 録音の開始・停止（スラッシュコマンドとボタンの共通処理）
+# ----------------------------------------------------------------------
+async def start_recording_flow(guild, member, text_channel) -> str:
+    """録音を開始し、ユーザーに返すメッセージを文字列で返す。"""
+    if guild.id in connections:
+        return "すでに録音中です。停止するには停止ボタン（または /stop）を使ってください。"
+
+    if not member.voice or not member.voice.channel:
+        return "先にボイスチャンネルに参加してから開始してください。"
+
+    channel = member.voice.channel
+
+    # 前回の接続が残っていると新しい接続を確立できないので、掃除してから入り直す。
+    # （botを強制終了した後などに発生する）
+    if guild.voice_client is not None:
+        await _force_disconnect(guild.voice_client)
+        await asyncio.sleep(1)
+
+    try:
+        vc = await channel.connect(timeout=30.0, reconnect=False)
+    except Exception as e:
+        return f"ボイスチャンネルへの接続に失敗しました: {e}{_explain_voice_error(e)}"
+
+    if not await _wait_connected(vc):
+        await _force_disconnect(vc)
+        return (
+            "ボイスチャンネルには入れましたが、音声接続が確立できませんでした。\n"
+            "もう一度お試しください。繰り返す場合はネットワークがDiscordの音声通信を"
+            "ブロックしている可能性があります。"
+        )
 
     meeting_name = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     meeting_dir = REC_DIR / meeting_name
     meeting_dir.mkdir(parents=True, exist_ok=True)
 
-    connections[ctx.guild.id] = {"vc": vc, "dir": meeting_dir, "channel": ctx.channel}
+    connections[guild.id] = {"vc": vc, "dir": meeting_dir, "channel": text_channel}
 
     # 録音開始。停止すると on_recording_finished が呼ばれる。
-    vc.start_recording(
-        discord.sinks.WaveSink(),   # 話者ごとに WAV を作る
-        on_recording_finished,      # 停止時に呼ばれるコールバック
-        ctx.guild.id,               # コールバックへ渡す追加引数
-    )
+    try:
+        vc.start_recording(
+            discord.sinks.WaveSink(),   # 話者ごとに WAV を作る
+            on_recording_finished,      # 停止時に呼ばれるコールバック
+            guild.id,                   # コールバックへ渡す追加引数
+        )
+    except Exception as e:
+        connections.pop(guild.id, None)
+        await _force_disconnect(vc)
+        return f"録音の開始に失敗しました: {e}"
 
-    await ctx.respond(
+    print(f"録音開始: {meeting_name} / チャンネル={channel.name}")
+    return (
         f"🎙️ 録音を開始しました（**{meeting_name}**）。\n"
         f"チャンネル: **{channel.name}**\n"
-        f"終了するには **/stop** を実行してください。"
+        f"終了するには **停止ボタン**（または /stop）を押してください。"
     )
+
+
+async def stop_recording_flow(guild) -> str:
+    """録音を停止し、ユーザーに返すメッセージを文字列で返す。"""
+    if guild.id not in connections:
+        return "現在は録音していません。"
+
+    vc = connections[guild.id]["vc"]
+    try:
+        vc.stop_recording()  # -> on_recording_finished が呼ばれる
+    except Exception as e:
+        # ここで応答せずに落ちると「アプリケーションが応答しませんでした」になるため必ず返す
+        connections.pop(guild.id, None)
+        await _force_disconnect(vc)
+        return (
+            f"録音の停止に失敗しました: {e}\n"
+            "接続を切りました。もう一度開始からやり直してください。"
+        )
+
+    return "⏹️ 録音を停止しました。文字起こし→議事録作成を始めます…（数分かかります）"
+
+
+# ----------------------------------------------------------------------
+# 操作パネル（ボタン）
+# ----------------------------------------------------------------------
+class RecordPanel(discord.ui.View):
+    """録音開始・停止のボタンを持つパネル。
+
+    timeout=None かつ custom_id 付きなので、bot を再起動しても
+    設置済みのパネルのボタンがそのまま使える（永続View）。
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="録音開始", emoji="🔴",
+        style=discord.ButtonStyle.danger, custom_id="minutes_bot_start",
+    )
+    async def start_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        # ボイス接続に3秒以上かかることがあるため、先に応答を保留する
+        await interaction.response.defer()
+        msg = await start_recording_flow(
+            interaction.guild, interaction.user, interaction.channel
+        )
+        await interaction.followup.send(msg)
+
+    @discord.ui.button(
+        label="停止して議事録作成", emoji="⏹️",
+        style=discord.ButtonStyle.primary, custom_id="minutes_bot_stop",
+    )
+    async def stop_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.defer()
+        msg = await stop_recording_flow(interaction.guild)
+        await interaction.followup.send(msg)
+
+
+@bot.event
+async def on_ready():
+    # 設置済みパネルのボタンを再起動後も有効にする
+    bot.add_view(RecordPanel())
+    print("=" * 50)
+    print(f"ログイン成功: {bot.user}  (bot準備完了)")
+    print("Discordで /panel を実行すると、録音開始・停止ボタンを設置できます。")
+    print("※ 会議は「ステージチャンネル」で行ってください（通常のVCは4017で接続不可）。")
+    print("=" * 50)
+    _cleanup_old_recordings()
+
+
+@bot.slash_command(description="録音の開始・停止ボタンを設置します")
+async def panel(ctx: discord.ApplicationContext):
+    await ctx.respond(
+        "**🎙️ 議事録作成bot**\n"
+        "1. **ステージチャンネル**に参加し「ステージを開始」でスピーカーになる\n"
+        "2. **録音開始** を押す\n"
+        "3. 会議が終わったら **停止して議事録作成** を押す\n"
+        "→ 文字起こしと議事録がこのチャンネルに投稿されます。",
+        view=RecordPanel(),
+    )
+
+
+# ----------------------------------------------------------------------
+# スラッシュコマンド（ボタンと同じ処理）
+# ----------------------------------------------------------------------
+@bot.slash_command(description="今いるボイスチャンネルの録音を開始します")
+async def record(ctx: discord.ApplicationContext):
+    await ctx.defer()
+    msg = await start_recording_flow(ctx.guild, ctx.author, ctx.channel)
+    await ctx.respond(msg)
 
 
 @bot.slash_command(description="録音を停止し、議事録の作成を開始します")
 async def stop(ctx: discord.ApplicationContext):
-    if ctx.guild.id not in connections:
-        await ctx.respond("現在は録音していません。", ephemeral=True)
+    await ctx.defer()
+    msg = await stop_recording_flow(ctx.guild)
+    await ctx.respond(msg)
+
+
+@bot.slash_command(description="botをボイスチャンネルから強制的に退出させます（復旧用）")
+async def leave(ctx: discord.ApplicationContext):
+    """録音状態がおかしくなったときの復旧用。録音は破棄される。"""
+    info = connections.pop(ctx.guild.id, None)
+    vc = ctx.guild.voice_client
+
+    if info is None and vc is None:
+        await ctx.respond("botはボイスチャンネルにいません。", ephemeral=True)
         return
 
-    vc = connections[ctx.guild.id]["vc"]
-    vc.stop_recording()  # -> on_recording_finished が呼ばれる
-    await ctx.respond("⏹️ 録音を停止しました。文字起こし→議事録作成を始めます…（数分かかります）")
+    await _force_disconnect(vc)
+    await ctx.respond("👋 ボイスチャンネルから退出しました（録音中だった場合は破棄されます）。", ephemeral=True)
 
 
 @bot.slash_command(description="現在の録音状態を確認します")
 async def status(ctx: discord.ApplicationContext):
     if ctx.guild.id in connections:
         name = connections[ctx.guild.id]["dir"].name
-        await ctx.respond(f"🔴 録音中です（{name}）。停止するには /stop。", ephemeral=True)
+        await ctx.respond(f"🔴 録音中です（{name}）。停止するには停止ボタン。", ephemeral=True)
     else:
-        await ctx.respond("⚪ 現在は録音していません。/record で開始できます。", ephemeral=True)
+        await ctx.respond("⚪ 現在は録音していません。録音開始ボタンで始められます。", ephemeral=True)
 
 
+# ----------------------------------------------------------------------
+# 録音停止後の処理（保存 → 文字起こし → 議事録 → 投稿）
+# ----------------------------------------------------------------------
 async def on_recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
-    """録音停止時に呼ばれる。音声を保存し、議事録パイプラインを実行する。"""
+    """録音停止時に py-cord から呼ばれる。音声を保存し、議事録パイプラインを実行する。"""
     info = connections.pop(guild_id, None)
+
     # ボイスチャンネルから退出
-    try:
-        await sink.vc.disconnect()
-    except Exception:
-        pass
+    await _force_disconnect(getattr(sink, "vc", None))
 
     if info is None:
         return
@@ -193,6 +404,7 @@ async def on_recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
 
     # 各話者の音声を保存
     saved = 0
+    skipped_silent = 0
     for user_id, audio in sink.audio_data.items():
         # サーバーニックネーム優先で話者名を決める
         display = str(user_id)
@@ -207,14 +419,34 @@ async def on_recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
         out_path = meeting_dir / f"{sanitize_filename(display)}.wav"
         try:
             audio.file.seek(0)
-            with open(out_path, "wb") as f:
-                f.write(audio.file.read())
+            pcm, channels, width, rate = _extract_pcm(audio.file.read())
+
+            # 中身が無いトラックを渡すと文字起こしが幻聴を起こすので捨てる
+            if len(pcm) < MIN_TRACK_BYTES:
+                print(f"スキップ（ほぼ無音）: {display}  {len(pcm)}バイト")
+                skipped_silent += 1
+                continue
+
+            # py-cord の壊れたヘッダを使わず、正しい WAV として書き直す
+            with wave.open(str(out_path), "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(width)
+                wf.setframerate(rate)
+                wf.writeframes(pcm)
+
+            secs = len(pcm) / (rate * channels * width)
+            print(f"保存: {out_path.name}  ({secs:.1f}秒 / {len(pcm):,}バイト)")
             saved += 1
         except Exception as e:
             print(f"音声保存エラー ({display}): {e}")
 
     if saved == 0:
-        await channel.send("⚠️ 録音データが空でした。誰も発言していなかった可能性があります。")
+        await channel.send(
+            "⚠️ 録音データが空でした。\n"
+            "ステージチャンネルで**「ステージを開始」してスピーカーになっているか**"
+            "確認してください（聴衆のままだと音声が流れません）。\n"
+            f"（受信トラック数: {len(sink.audio_data)} / 無音として破棄: {skipped_silent}）"
+        )
         return
 
     await channel.send(
