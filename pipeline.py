@@ -161,16 +161,32 @@ def run(meeting_dir):
     """
     会議フォルダを処理し、書き起こしと議事録を同フォルダ内に保存する。
     返り値: 議事録ファイルのパス（要約できなかった場合は書き起こしのパス）。
+
+    途中で中断された場合に備えて、既にできている成果物は作り直さない。
+    文字起こしは録音時間の2倍以上かかることがあるため、
+    書き起こしが残っていればそれを再利用して要約だけやり直す。
     """
     meeting_dir = os.path.abspath(meeting_dir)
     meeting_name = os.path.basename(meeting_dir.rstrip("/\\"))
 
-    # 1. 書き起こし
-    transcript = build_transcript(meeting_dir)
     transcript_path = os.path.join(meeting_dir, f"{meeting_name}_書き起こし.txt")
-    with open(transcript_path, "w", encoding="utf-8") as f:
-        f.write(transcript)
-    print(f"✓ 書き起こしを保存: {transcript_path}")
+    minutes_path = os.path.join(meeting_dir, f"{meeting_name}_議事録.txt")
+
+    # 既に議事録まで出来ていれば何もしない
+    if os.path.exists(minutes_path) and os.path.getsize(minutes_path) > 0:
+        print(f"既に議事録があります。処理をスキップします: {minutes_path}")
+        return minutes_path
+
+    # 1. 書き起こし（既にあれば再利用する＝中断からの再開）
+    if os.path.exists(transcript_path) and os.path.getsize(transcript_path) > 0:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            transcript = f.read()
+        print(f"既存の書き起こしを再利用します（文字起こしはやり直しません）: {transcript_path}")
+    else:
+        transcript = build_transcript(meeting_dir)
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(transcript)
+        print(f"✓ 書き起こしを保存: {transcript_path}")
 
     if not transcript.strip():
         print("発言が検出されませんでした。議事録は作成しません。")
@@ -181,7 +197,6 @@ def run(meeting_dir):
     if summary is None:
         return transcript_path
 
-    minutes_path = os.path.join(meeting_dir, f"{meeting_name}_議事録.txt")
     with open(minutes_path, "w", encoding="utf-8") as f:
         f.write(summary)
     print(f"✓ 議事録を保存: {minutes_path}")
