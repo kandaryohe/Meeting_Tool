@@ -1,7 +1,6 @@
 import os
 import sys
 import glob
-import google.generativeai as genai
 
 try:
     from dotenv import load_dotenv
@@ -9,7 +8,7 @@ try:
 except Exception:
     pass  # python-dotenv が無くても環境変数が直接設定されていれば動く
 
-from gemini_utils import generate_with_retry
+from gemini_utils import generate_with_retry, make_client
 
 # ======================================================================
 # 【設定】使用するAIモデルの指定
@@ -24,12 +23,12 @@ MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 # ======================================================================
 
 def setup_gemini():
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("エラー: 環境変数 'GEMINI_API_KEY' が設定されていません。")
+    """(クライアント, システム指示) を返す。"""
+    try:
+        client = make_client()
+    except Exception as e:
+        print(f"エラー: {e}")
         sys.exit(1)
-
-    genai.configure(api_key=api_key)
 
     prompt_path = "prompt.txt"
     if not os.path.exists(prompt_path):
@@ -39,12 +38,7 @@ def setup_gemini():
     with open(prompt_path, "r", encoding="utf-8") as f:
         system_instruction = f.read().strip()
 
-    # Geminiモデルの初期化 (上部で設定した MODEL_NAME を読み込みます)
-    model = genai.GenerativeModel(
-        model_name=MODEL_NAME,
-        system_instruction=system_instruction
-    )
-    return model
+    return client, system_instruction
 
 if __name__ == "__main__":
     output_dir = "output"
@@ -54,7 +48,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print(f"★ Gemini API ({MODEL_NAME}) による要約処理を開始します...")
-    gemini_model = setup_gemini()
+    gemini_client, system_instruction = setup_gemini()
 
     # 要約対象のファイルを取得（すでに要約済みの _summary.txt は除外）
     txt_files = [f for f in glob.glob(os.path.join(output_dir, "*.txt")) if not f.endswith("_summary.txt")]
@@ -78,9 +72,12 @@ if __name__ == "__main__":
             continue
 
         try:
-            response = generate_with_retry(gemini_model, transcribed_text)
+            summary = generate_with_retry(
+                gemini_client, transcribed_text, MODEL_NAME,
+                system_instruction=system_instruction,
+            )
             with open(summary_path, "w", encoding="utf-8") as f:
-                f.write(response.text)
+                f.write(summary)
             print(f"  -> ✓ 保存完了: {os.path.basename(summary_path)}")
         except Exception as e:
             print(f"  -> エラーが発生しました（リトライ済み）: {e}")

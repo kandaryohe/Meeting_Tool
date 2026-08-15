@@ -30,7 +30,7 @@ except Exception:
 
 
 from whisper_utils import load_whisper_pipeline, transcribe_segments, format_timestamp
-from gemini_utils import generate_with_retry
+from gemini_utils import generate_with_retry, make_client, describe_error
 
 
 def _ensure_ffmpeg_on_path():
@@ -127,12 +127,10 @@ def summarize_with_gemini(transcript_text):
         return None
 
     try:
-        import google.generativeai as genai
-    except ImportError:
-        print("警告: google-generativeai が未インストールのため要約をスキップします。")
+        client = make_client(api_key)
+    except Exception as e:
+        print(f"警告: Gemini クライアントを作れないため要約をスキップします: {e}")
         return None
-
-    genai.configure(api_key=api_key)
 
     prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt.txt")
     system_instruction = None
@@ -140,17 +138,15 @@ def summarize_with_gemini(transcript_text):
         with open(prompt_path, "r", encoding="utf-8") as f:
             system_instruction = f.read().strip()
 
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL_NAME,
-        system_instruction=system_instruction,
-    )
-
     print(f"★ Gemini ({GEMINI_MODEL_NAME}) で議事録を作成中...")
     try:
-        response = generate_with_retry(model, transcript_text)
-        return response.text
+        return generate_with_retry(
+            client, transcript_text, GEMINI_MODEL_NAME,
+            system_instruction=system_instruction,
+        )
     except Exception as e:
-        print(f"警告: 要約中にエラーが発生しました（リトライ済み）: {e}")
+        print(f"警告: 要約に失敗しました（リトライ済み）: {describe_error(e)}")
+        print("　書き起こしは保存済みです。同じフォルダで再実行すれば要約だけやり直せます。")
         return None
 
 

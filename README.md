@@ -130,7 +130,7 @@ Discord を使わず、手元の音声ファイルから議事録を作る場合
 | `議事録bot起動.bat` | bot を手動で起動 | － |
 | `prompt.txt` | 議事録の書式・要約方針を指示するプロンプト | － |
 | `whisper_utils.py` | 文字起こしの共通処理（モデル読み込み・タイムスタンプ整形） | Python 3.14 |
-| `gemini_utils.py` | Gemini 呼び出しの共通処理（リトライ付き） | Python 3.14 |
+| `gemini_utils.py` | Gemini 呼び出しの共通処理（`google-genai` SDK・リトライ・エラー説明） | Python 3.14 |
 | `text_utils.py` | ファイル名のサニタイズなど共通処理 | 両方 |
 | `tests/test_helpers.py` | 共通処理のテスト（`py -3.14 -m pytest`） | Python 3.14 |
 
@@ -182,7 +182,7 @@ py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements-bot.txt
 
 # 文字起こし・要約用（Python 3.14）
-py -3.14 -m pip install torch transformers google-generativeai python-dotenv
+py -3.14 -m pip install torch transformers google-genai python-dotenv
 
 # ffmpeg（音声処理）
 winget install Gyan.FFmpeg
@@ -205,7 +205,8 @@ winget install Gyan.FFmpeg
 | bot がコマンドに反応しない | 招待時に `applications.commands` スコープを付けたか確認 |
 | `ffmpegが見つかりません` | `winget install Gyan.FFmpeg` 実行後、PC を再起動 |
 | 議事録が作られず書き起こしだけできる | `.env` の `GEMINI_API_KEY` が未設定です |
-| 要約が `429`（クォータ超過） | `GEMINI_MODEL=gemini-pro-latest` にしている場合は有料枠が必要です。既定の `gemini-flash-latest` に戻してください |
+| 要約が `429`（利用上限） | 無料枠は**1モデルあたり1日20リクエスト**です。時間をおいて再実行するか、`.env` に `GEMINI_MODEL=gemini-flash-lite-latest` を設定してください（別枠）。書き起こしは残っているので、要約だけ数十秒でやり直せます |
+| 要約が `503`（混雑） | Gemini 側の一時的な混雑です。サーバー指定の待機時間で自動リトライしますが、続く場合は時間をおいてください |
 | 文字起こしが遅い | GPU が無く CPU 処理になっています。会議が長いほど時間がかかります |
 | 議事録の内容が「特になし」ばかり | 録音に会議の実体が無い場合の正常動作です。`prompt.txt` が「発言されていない結論を作らない」方針のため |
 
