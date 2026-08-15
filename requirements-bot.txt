@@ -4,6 +4,29 @@
 # ※ 音声録音ライブラリ(Pycord)は Python 3.13 で動作確認しています。
 #    Python 3.14 は対応が不十分なため 3.13 を使ってください。
 
-py-cord[voice]>=2.6.1   # Discord bot 本体 + 音声送受信(録音)機能
+# バージョン固定（重要）: 2.7.2 でなければ録音できない。上げても下げてもダメ。
+#
+# 2.8.0 以降がダメな理由:
+#   - davey を組み込んで DAVE(E2E暗号化)対応を"名乗る"が復号の実装が不完全。
+#     2026-08-15 の実測では受信312パケット中、復号できたのは2個だけで
+#     録音内容が雑音になった。
+#   - 音声受信の作りも変わり、標準の WaveSink が start_recording で
+#     AttributeError になる（'WaveSink' object has no attribute
+#     '__sink_listeners__'）。voice_client.py も voice/client.py へ移動。
+#
+# 2.6.1 以前がダメな理由:
+#   - ボイスゲートウェイが v4。Discord が v4 を廃止したため接続直後に
+#     「WebSocket closed with 4006」(セッション無効)で切断される。
+#
+# 2.7.2 が良い理由:
+#   - ボイスゲートウェイ v8（接続できる）
+#   - DAVE のコードを一切持たない → 対応を名乗らないので DAVE の
+#     ダウングレード機構が働き、音声が平文で受信できる
+#   - start_recording は旧API のままで、標準の WaveSink がそのまま使える
+#
+# 参考: https://github.com/Pycord-Development/pycord/issues/3139
+# 上記 issue が解決されたら 2.8+ に上げてよいが、その際は
+# discord_bot.py の Sink/コールバック方式も新APIに合わせて要修正。
+py-cord[voice]==2.7.2   # Discord bot 本体 + 音声送受信(録音)機能
 audioop-lts             # Python 3.13以降で削除された audioop の代替（Pycord音声処理に必須）
 python-dotenv           # .env からトークン等を読み込む
