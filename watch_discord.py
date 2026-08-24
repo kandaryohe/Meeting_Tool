@@ -8,6 +8,7 @@ Discord議事録bot 自動起動ウォッチャー（画面なし常駐）
   Windowsログイン時にスタートアップから自動起動される。
 """
 
+import ctypes
 import os
 import sys
 import time
@@ -25,9 +26,13 @@ WATCHER_LOG = os.path.join(BASE, "watcher.log")
 
 CREATE_NO_WINDOW = 0x08000000  # 起動する bot に黒い窓を出さないフラグ
 
-CHECK_INTERVAL = 7          # Discord の起動状態を見に行く間隔（秒）
-LAUNCH_COOLDOWN = 30        # 起動直後、次の起動判定を保留する時間（秒）
-MAX_LOG_BYTES = 2_000_000   # これを超えたログは .old.log に退避してから書き直す
+CHECK_INTERVAL = 7            # Discord の起動状態を見に行く間隔（秒）
+LAUNCH_COOLDOWN = 30          # 起動直後、次の起動判定を保留する時間（秒）
+FAILED_LAUNCH_BACKOFF = 120   # 起動に失敗したときに次を試すまでの時間（秒）
+LAUNCH_CHECK_DELAY = 3        # 起動したプロセスが生きているか確認するまでの待ち時間（秒）
+MAX_LOG_BYTES = 2_000_000     # これを超えたログは .old.log に退避してから書き直す
+
+SM_SHUTTINGDOWN = 0x2000      # GetSystemMetrics: シャットダウン処理中かどうか
 
 
 def notify(title, message):
@@ -50,6 +55,23 @@ def wlog(msg):
             f.write(f"{ts} {msg}\n")
     except Exception:
         pass
+
+
+def system_shutting_down():
+    """Windows がシャットダウン／ログオフ処理中か。
+
+    処理中はセッションが壊されていく途中なので、ここで起動したプロセスは
+    DLL の初期化に失敗して 0xc0000142 で即死し、画面には
+    「アプリケーションを正しく起動できませんでした」のダイアログだけが残る。
+
+    2026-08-19 22:25 に実際に起きた。シャットダウンを VS Code の
+    インストーラが拒否したためセッションが約65秒間その状態で止まり、
+    その間ウォッチャーが7秒ごとに6回 bot を起動しようとして全部失敗した。
+    """
+    try:
+        return bool(ctypes.windll.user32.GetSystemMetrics(SM_SHUTTINGDOWN))
+    except Exception:
+        return False
 
 
 def discord_running():
@@ -116,12 +138,22 @@ def start_bot():
                 cwd=BASE, stdout=out_f, stderr=err_f,
                 creationflags=CREATE_NO_WINDOW,
             )
-        wlog(f"bot を起動しました (PID {proc.pid})")
-        notify("議事録bot", "🎙️ 議事録botが起動しました。\n録音開始ボタン（または /record）が使えます。")
-        return proc.pid
     except Exception as e:
         wlog(f"bot起動に失敗: {e}")
         return None
+
+    # Popen が成功しても、プロセスが起動直後に死ぬことがある
+    # （シャットダウン中の 0xc0000142 など）。確認せずに通知すると
+    # 「起動しました」と嘘をつくことになるので、少し待って生死を見る。
+    time.sleep(LAUNCH_CHECK_DELAY)
+    code = proc.poll()
+    if code is not None:
+        wlog(f"bot が起動直後に終了しました (PID {proc.pid} / 終了コード 0x{code & 0xffffffff:08x})")
+        return None
+
+    wlog(f"bot を起動しました (PID {proc.pid})")
+    notify("議事録bot", "🎙️ 議事録botが起動しました。\n録音開始ボタン（または /record）が使えます。")
+    return proc.pid
 
 
 def stop_bots(pids):
@@ -138,8 +170,10 @@ def main():
     rotate_log(WATCHER_LOG)
     wlog("ウォッチャー開始")
 
-    last_launch = 0.0   # 直近で bot を起動した時刻（連続起動の抑止に使う）
-    known_pids = []     # 前回の巡回で見えていた bot の PID
+    last_launch = 0.0             # 直近で bot を起動した時刻（連続起動の抑止に使う）
+    cooldown = LAUNCH_COOLDOWN    # 次の起動を試みるまでの待ち時間
+    known_pids = []               # 前回の巡回で見えていた bot の PID
+    shutdown_logged = False       # シャットダウン中の記録は1回だけにする
 
     while True:
         d = discord_running()
@@ -155,16 +189,25 @@ def main():
         if instances > 1:
             wlog(f"警告: botが{instances}個動いています (PID {', '.join(map(str, pids))})")
         known_pids = pids
+        if not system_shutting_down():
+            shutdown_logged = False
 
         if d and not pids:
-            # 起動直後はプロセスがまだ見えないことがある。
-            # そのまま次の巡回で起動し直すと bot が多重起動するため、少し待つ。
-            if time.time() - last_launch < LAUNCH_COOLDOWN:
-                wlog("bot がまだ見えませんが、起動直後のため待機します")
+            if system_shutting_down():
+                # ここで起動しても 0xc0000142 で即死し、エラーダイアログが出るだけ
+                if not shutdown_logged:
+                    wlog("システムがシャットダウン中のため bot を起動しません")
+                    shutdown_logged = True
+            elif time.time() - last_launch < cooldown:
+                # 起動直後はプロセスがまだ見えないことがある。
+                # そのまま次の巡回で起動し直すと bot が多重起動するため待つ。
+                pass
             else:
                 wlog("Discord検知 → bot を起動します")
-                start_bot()
+                started = start_bot()
                 last_launch = time.time()
+                # 失敗したなら原因が続いている可能性が高いので長めに待つ
+                cooldown = LAUNCH_COOLDOWN if started else FAILED_LAUNCH_BACKOFF
         elif (not d) and pids:
             wlog("Discord終了 → bot を停止します")
             stop_bots(pids)
