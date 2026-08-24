@@ -119,6 +119,7 @@ def build_transcript(meeting_dir):
     pipe = load_whisper_pipeline()
 
     all_segments = []  # (start, end, speaker, text)
+    failed = 0
     for i, path in enumerate(audio_files, 1):
         # ファイル名（拡張子なし）を話者名として使う
         speaker = os.path.splitext(os.path.basename(path))[0]
@@ -127,7 +128,17 @@ def build_transcript(meeting_dir):
             for start, end, text in transcribe_segments(pipe, path):
                 all_segments.append((start, end, speaker, text))
         except Exception as e:
+            failed += 1
             print(f"  -> 警告: {speaker} のトラックでエラー: {e}")
+
+    # 全部失敗した場合は「発言が無かった」ではなく異常。
+    # ここで空を返すと「発言なし」の目印が付いてしまい、
+    # 原因を直しても二度とやり直さなくなる。
+    if failed == len(audio_files):
+        raise RuntimeError(
+            f"すべての音声トラック({failed}件)で文字起こしに失敗しました。"
+            "音声ファイルが壊れているか、ffmpeg が正しく動いていない可能性があります。"
+        )
 
     # 発言開始時刻でソート（＝会話の流れの順番に並ぶ）
     all_segments.sort(key=lambda x: x[0])

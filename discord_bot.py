@@ -144,6 +144,9 @@ connections = {}
 # /status の表示と、同じ会議を二重に処理しないための管理に使う。
 processing: set = set()
 
+# 起動時の掃除・再開を一度だけ実行するための目印（on_ready は再接続でも呼ばれる）
+_startup_done = False
+
 # 会議フォルダに残すメタ情報のファイル名。
 # bot が落ちたあと、どのチャンネルへ結果を返せばよいか復元するために使う。
 META_NAME = "_meeting.json"
@@ -523,6 +526,14 @@ class RecordPanel(discord.ui.View):
 
 @bot.event
 async def on_ready():
+    """接続完了時に呼ばれる。
+
+    注意: on_ready はネットワークが切れて再接続するたびに呼ばれる。
+    掃除と再開は起動時に一度だけ実行する（毎回やると、要約に失敗した会議を
+    再接続のたびに要約し直して Gemini の1日20回の枠を消費してしまう）。
+    """
+    global _startup_done
+
     # 設置済みパネルのボタンを再起動後も有効にする
     bot.add_view(RecordPanel())
     print("=" * 50)
@@ -530,6 +541,12 @@ async def on_ready():
     print("Discordで /panel を実行すると、録音開始・停止ボタンを設置できます。")
     print("※ 会議は「ステージチャンネル」で行ってください（通常のVCは4017で接続不可）。")
     print("=" * 50)
+
+    if _startup_done:
+        print("（再接続のため、掃除と再開の処理は行いません）")
+        return
+    _startup_done = True
+
     _cleanup_old_recordings()
     # 前回の中断で議事録が出来ていない会議があれば、続きから自動で仕上げる
     await _resume_unfinished()
@@ -649,7 +666,8 @@ async def on_recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
             print(f"音声保存エラー ({display}): {e}")
 
     if saved == 0:
-        await channel.send(
+        await _send(
+            channel,
             "⚠️ 録音データが空でした。\n"
             "ステージチャンネルで**「ステージを開始」してスピーカーになっているか**"
             "確認してください（聴衆のままだと音声が流れません）。\n"
@@ -657,7 +675,10 @@ async def on_recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
         )
         return
 
-    await channel.send(
+    # 投稿は _send を通すこと。ここで例外が出ると議事録の作成自体が
+    # 始まらないまま終わってしまう（次回起動時の再開まで放置される）。
+    await _send(
+        channel,
         f"⏺️ 録音を保存しました（{saved}人分）。\n"
         f"文字起こし→議事録作成を実行中です…しばらくお待ちください。\n"
         f"（CPU処理のため、録音時間のおよそ2〜3倍かかります）"
@@ -782,15 +803,17 @@ async def _resume_unfinished() -> None:
         if not (has_transcript or has_audio):
             continue  # 素材が無いので何もできない
 
-        meta = _read_meta(d)
-        channel = bot.get_channel(meta["channel_id"]) if meta else None
+        # メタ情報が壊れていても、他の会議の再開まで巻き添えにしない
+        meta = _read_meta(d) or {}
+        channel_id = meta.get("channel_id")
+        channel = bot.get_channel(channel_id) if channel_id else None
 
         stage = "書き起こし済み（要約のみ）" if has_transcript else "音声のみ（文字起こしから）"
         print(f"未完了の会議を検出したので再開します: {name} … {stage}")
-        if channel is not None:
-            await channel.send(
-                f"🔁 中断していた会議 **{name}** の議事録作成を再開します（{stage}）。"
-            )
+        await _send(
+            channel,
+            f"🔁 中断していた会議 **{name}** の議事録作成を再開します（{stage}）。"
+        )
         asyncio.create_task(_process_and_post(d, channel))
 
 
