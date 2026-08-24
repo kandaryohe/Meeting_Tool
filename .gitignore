@@ -1,9 +1,3 @@
-# 音声ファイル・出力結果（個人情報を含む可能性があるため除外）
-input/*
-output/*
-!input/.gitkeep
-!output/.gitkeep
-
 # Discord録音bot の録音・議事録データ（個人情報を含むため除外）
 recordings/
 
@@ -13,6 +7,7 @@ recordings/
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
 .venv/
 venv/
 

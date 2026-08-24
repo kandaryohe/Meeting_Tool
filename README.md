@@ -57,6 +57,14 @@ bot が以下を自動でやるので、**参加者は出てきた「追加」�
 4. 会議が終わったら **⏹️ 停止して議事録作成** を押す
 5. しばらくすると、同じチャンネルに **議事録ファイル**が投稿されます
 
+投稿されるメッセージは3種類です。
+
+| 表示 | 意味 | その後 |
+|---|---|---|
+| ✅ 議事録が完成しました！ | 成功。議事録を添付 | 音声は自動削除（書き起こしと議事録は残る） |
+| ⚠️ 要約に失敗しました | 文字起こしは成功。書き起こしを添付 | bot を再起動すると**要約だけ**自動でやり直す（約30秒） |
+| ⚠️ 発言が見つかりませんでした | 録音に音声が入っていない | 会議フォルダに `_no_speech.txt` が残り、以後は再処理しない |
+
 - パネルは bot を再起動しても押せます（永続 View）。
 - ボタンの代わりに `/record` `/stop` でも同じことができます。
 - 録音・議事録データは `recordings/<日時>/` に保存されます（Git 管理外）。
@@ -131,18 +139,16 @@ Discord を使わず、手元の音声ファイルから議事録を作る場合
 | `prompt.txt` | 議事録の書式・要約方針を指示するプロンプト | － |
 | `whisper_utils.py` | 文字起こしの共通処理（モデル読み込み・タイムスタンプ整形） | Python 3.14 |
 | `gemini_utils.py` | Gemini 呼び出しの共通処理（`google-genai` SDK・リトライ・エラー説明） | Python 3.14 |
+| `audio_utils.py` | 録音データの共通処理（py-cordの壊れたWAVヘッダの修復・WAV書き出し） | 両方 |
 | `text_utils.py` | ファイル名のサニタイズなど共通処理 | 両方 |
-| `tests/test_helpers.py` | 共通処理のテスト（`py -3.14 -m pytest`） | Python 3.14 |
+| `tests/test_helpers.py` | 共通処理のテスト（`py -3.14 -m pytest tests`） | Python 3.14 |
+
+使用しているライブラリは、bot 側が `requirements-bot.txt`、
+文字起こし・要約側が torch / transformers / google-genai / python-dotenv です。
+文字起こしモデルは `kotoba-tech/kotoba-whisper-v2.2`（日本語特化）。
 
 > 録音ライブラリ(py-cord)の都合で bot は **Python 3.13**、
 > 文字起こし(torch)は **Python 3.14** を使い、bot がサブプロセスで呼び分けます。
-
-### 現在使われていないファイル
-
-| ファイル | 状態 |
-|---|---|
-| `recording_sink.py` / `pycord_voice_patch.py` | py-cord 2.8 系向け。issue #3139 が解決して 2.8 に上げるときのために残してある。**現在は未使用** |
-| `run_whisper.py` / `run_gemini.py` / `run_pipeline.bat` / `文字起こし.bat` | 旧方式（`input/`→`output/`）。話者名も時刻も付かない。**`議事録作成.bat` を使ってください** |
 
 ---
 
@@ -151,11 +157,13 @@ Discord を使わず、手元の音声ファイルから議事録を作る場合
 ### 1. Discord bot を用意する
 1. https://discord.com/developers/applications → **New Application**
 2. 左メニュー **Bot** → **Reset Token** でトークンを取得（後で `.env` に貼る）
-3. 同じ Bot 画面で **MESSAGE CONTENT INTENT** を ON
-4. 左メニュー **OAuth2 → URL Generator**
+3. 左メニュー **OAuth2 → URL Generator**
    - SCOPES: `bot` と `applications.commands`（**両方必須**。欠けるとコマンドを登録できない）
    - BOT PERMISSIONS: `Connect` / `Speak` / `Use Voice Activity` / `Send Messages` / `Attach Files`
    - 生成 URL を開き、**自分のサーバーに招待**
+
+> 特権インテント（MESSAGE CONTENT INTENT など）の設定は不要です。
+> bot はスラッシュコマンドとボイス状態しか使いません。
 
 ### 2. Gemini API キーを用意する
 - https://aistudio.google.com/ で API キーを取得
@@ -171,8 +179,9 @@ GEMINI_MODEL=（省略可。既定は gemini-flash-latest）
 ```
 
 > 以下は任意設定です（未設定でも動きます）:
-> - `DELETE_AUDIO_AFTER_PROCESSING` … 議事録作成成功後、生の音声ファイルを自動削除するか（既定: `true`）。書き起こし・議事録は残ります。
-> - `RECORDINGS_RETENTION_DAYS` … `recordings/` 内の古い会議フォルダを bot 起動時に自動削除するまでの日数（既定: `30`。0以下で無効化）。
+> - `GEMINI_FALLBACK_MODEL` … 本命モデルが混雑(503)や上限(429)で使えないときに切り替える予備モデル（既定: `gemini-flash-lite-latest`）。空にすると切り替えません。
+> - `DELETE_AUDIO_AFTER_PROCESSING` … **議事録まで完成したとき**に生の音声ファイルを自動削除するか（既定: `true`）。書き起こし・議事録は残ります。要約に失敗した場合や発言が無かった場合は、やり直せるように音声を残します。
+> - `RECORDINGS_RETENTION_DAYS` … `recordings/` 内の古い会議フォルダを bot 起動時に自動削除するまでの日数（既定: `30`。0以下で無効化）。中身が空のフォルダ（接続に失敗した回などで出来る）はこの設定に関係なく削除されます。
 
 ### 4. 依存パッケージ（すでに導入済みなら不要）
 
@@ -205,10 +214,23 @@ winget install Gyan.FFmpeg
 | bot がコマンドに反応しない | 招待時に `applications.commands` スコープを付けたか確認 |
 | `ffmpegが見つかりません` | `winget install Gyan.FFmpeg` 実行後、PC を再起動 |
 | 議事録が作られず書き起こしだけできる | `.env` の `GEMINI_API_KEY` が未設定です |
-| 要約が `429`（利用上限） | 無料枠は**1モデルあたり1日20リクエスト**です。時間をおいて再実行するか、`.env` に `GEMINI_MODEL=gemini-flash-lite-latest` を設定してください（別枠）。書き起こしは残っているので、要約だけ数十秒でやり直せます |
-| 要約が `503`（混雑） | Gemini 側の一時的な混雑です。サーバー指定の待機時間で自動リトライしますが、続く場合は時間をおいてください |
+| 要約が `429`（利用上限） | 無料枠は**1モデルあたり1日20リクエスト**です。予備モデルへ自動で切り替わりますが、両方使い切った場合は時間をおいてください。書き起こしは残っているので、bot を再起動すれば要約だけ数十秒でやり直します |
+| 要約が `503`（混雑） | 本命モデルが混んでいます。**予備モデルへ自動で切り替わる**ので通常は何もしなくて構いません（ログに「予備モデル … で成功しました」と出ます）。両方駄目な場合は時間をおいて bot を再起動してください |
 | 文字起こしが遅い | GPU が無く CPU 処理になっています。会議が長いほど時間がかかります |
 | 議事録の内容が「特になし」ばかり | 録音に会議の実体が無い場合の正常動作です。`prompt.txt` が「発言されていない結論を作らない」方針のため |
+
+### ログの見かた
+
+| ファイル | 内容 |
+|---|---|
+| `bot.out.log` | bot の動作ログ。各行の先頭に時刻が付きます |
+| `bot.err.log` | bot が異常終了したときのエラー内容。空なら異常終了していません |
+| `watcher.log` | 自動起動ウォッチャーの記録（bot の起動・停止・PID） |
+
+2MB を超えると `*.old.log` に退避して書き直すので、放置しても際限なく大きくなりません。
+
+> 文字起こし・要約（`pipeline.py`）の出力は、サブプロセスが終わってから
+> まとめて記録されます。そのため行に付く時刻は**その処理が終わった時刻**です。
 
 ### 議事録の書式を変えたいとき
 

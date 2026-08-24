@@ -103,12 +103,27 @@ def main() -> None:
         print(LINE)
         wait_and_exit(result.returncode)
 
+    # 終了コードが 0 でも、議事録まで出来ているとは限らない
+    # （発言が無かった／要約に失敗した場合も 0 で終わる）ので実物を確認する。
+    minutes = folder / f"{folder.name}_議事録.txt"
+    transcript = folder / f"{folder.name}_書き起こし.txt"
+
     print(LINE)
-    print("完了しました！")
-    print(f"{folder} の中に")
-    print("  〇〇_書き起こし.txt … 誰がいつ何を言ったか")
-    print("  〇〇_議事録.txt     … 要約された議事録")
-    print("が出来ています。")
+    if minutes.exists():
+        print("完了しました！")
+        print(f"{folder} の中に")
+        print(f"  {transcript.name} … 誰がいつ何を言ったか")
+        print(f"  {minutes.name} … 要約された議事録")
+        print("が出来ています。")
+    elif transcript.exists():
+        print("[注意] 書き起こしは出来ましたが、議事録は作れませんでした。")
+        print(f"  {transcript.name} は {folder} にあります。")
+        print("  ・Gemini の利用上限(429)や混雑(503)が原因のことが多いです")
+        print("  ・このフォルダをもう一度ドロップすれば、文字起こしはやり直さず")
+        print("    要約だけ数十秒で再実行します")
+    else:
+        print("[注意] 発言が検出されなかったため、議事録は作れませんでした。")
+        print("  録音に音声が入っているか確認してください。")
     print(LINE)
     wait_and_exit(0)
 

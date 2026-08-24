@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Gemini API 呼び出しの共通ヘルパー（run_gemini.py / pipeline.py で共有）。
+"""Gemini API 呼び出しの共通ヘルパー（pipeline.py から使う）。
 
 SDK は新しい `google-genai` を使う。
 旧 `google-generativeai` は提供元がサポートを終了しており、
@@ -35,6 +35,18 @@ def _retry_delay(error, default):
     return default
 
 
+def is_capacity_error(error) -> bool:
+    """「モデルが混んでいる/上限に達した」ことが原因のエラーか。
+
+    この種のエラーは同じモデルで待っても直らないことが多い一方、
+    別のモデルなら普通に通る（2026-08-24 に gemini-flash-latest が 503 で
+    使えず、gemini-flash-lite-latest では成功した）。
+    予備モデルに切り替えるかどうかの判断に使う。
+    """
+    s = str(error)
+    return any(k in s for k in ("RESOURCE_EXHAUSTED", "429", "UNAVAILABLE", "503"))
+
+
 def describe_error(error) -> str:
     """API エラーを、原因と対処が分かる短い日本語にする。"""
     s = str(error)
@@ -63,20 +75,8 @@ def make_client(api_key=None):
     return genai.Client(api_key=api_key)
 
 
-def generate_with_retry(
-    client, text, model_name, system_instruction=None,
-    max_retries=3, base_delay=2,
-):
-    """
-    Gemini でテキストを生成し、レート制限等の一時的なエラーに備えて
-    指数バックオフでリトライする。最終的に失敗した場合は例外を送出する。
-
-    返り値: 生成されたテキスト（str）
-    """
-    config = None
-    if system_instruction:
-        config = types.GenerateContentConfig(system_instruction=system_instruction)
-
+def _generate_once(client, text, model_name, config, max_retries, base_delay):
+    """1つのモデルに対して、リトライしながら生成を試みる。"""
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -97,3 +97,44 @@ def generate_with_retry(
                 time.sleep(delay)
 
     raise last_error
+
+
+def generate_with_retry(
+    client, text, model_name, system_instruction=None,
+    max_retries=3, base_delay=2, fallback_model=None,
+):
+    """
+    Gemini でテキストを生成し、一時的なエラーに備えてリトライする。
+
+    本命モデルが混雑(503)や上限(429)で使えない場合は、
+    fallback_model が指定されていればそちらに切り替えて試す。
+    同じモデルを待ち続けても復旧しないことが多く、
+    別モデルなら通ることが実際にあったため。
+
+    最終的に失敗した場合は例外を送出する。
+    返り値: 生成されたテキスト（str）
+    """
+    config = None
+    if system_instruction:
+        config = types.GenerateContentConfig(system_instruction=system_instruction)
+
+    try:
+        return _generate_once(client, text, model_name, config, max_retries, base_delay)
+    except Exception as e:
+        if not fallback_model or fallback_model == model_name or not is_capacity_error(e):
+            raise
+
+        print(
+            f"  -> {model_name} が使えません: {describe_error(e)}\n"
+            f"     予備モデル {fallback_model} に切り替えて再試行します..."
+        )
+        try:
+            result = _generate_once(
+                client, text, fallback_model, config, max_retries, base_delay
+            )
+        except Exception as fallback_error:
+            print(f"  -> 予備モデルでも失敗しました: {describe_error(fallback_error)}")
+            raise fallback_error from e
+
+        print(f"  -> 予備モデル {fallback_model} で成功しました。")
+        return result

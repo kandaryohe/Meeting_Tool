@@ -77,6 +77,27 @@ SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".mp4", ".flac"}
 # 品質を上げたい場合は .env に GEMINI_MODEL=gemini-pro-latest を設定する（有料枠が必要）。
 GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
+# 本命モデルが混雑(503)や上限(429)で使えないときに切り替える予備モデル。
+# 既定モデルだけが混んでいて別モデルなら通る、ということが実際に起きるため
+# （2026-08-24: gemini-flash-latest が 503、lite は成功）。
+# .env で GEMINI_FALLBACK_MODEL を空にすると切り替えを無効にできる。
+GEMINI_FALLBACK_MODEL_NAME = os.environ.get(
+    "GEMINI_FALLBACK_MODEL", "gemini-flash-lite-latest"
+).strip()
+
+# 処理結果の状態。呼び出し側（discord_bot.py）はこれを見て成否を判定する。
+# 「議事録は作れなかったが異常終了でもない」ケースがあるため、
+# 終了コードだけでは成功と失敗を区別できない。
+STATUS_OK = "ok"                          # 議事録まで完成した
+STATUS_NO_SPEECH = "no_speech"            # 発言が検出されなかった
+STATUS_SUMMARY_FAILED = "summary_failed"  # 書き起こしはできたが要約に失敗した
+
+# 発言が検出されなかった会議に置く目印のファイル名。
+# これが無いと、空の書き起こしが残った会議を bot が起動のたびに
+# 「未完了」として拾い直し、エラーを出し続けてしまう。
+# discord_bot.py の NO_SPEECH_MARKER と同じ名前にすること。
+NO_SPEECH_MARKER = "_no_speech.txt"
+
 
 def build_transcript(meeting_dir):
     """
@@ -143,6 +164,7 @@ def summarize_with_gemini(transcript_text):
         return generate_with_retry(
             client, transcript_text, GEMINI_MODEL_NAME,
             system_instruction=system_instruction,
+            fallback_model=GEMINI_FALLBACK_MODEL_NAME or None,
         )
     except Exception as e:
         print(f"警告: 要約に失敗しました（リトライ済み）: {describe_error(e)}")
@@ -156,7 +178,7 @@ def summarize_with_gemini(transcript_text):
 def run(meeting_dir):
     """
     会議フォルダを処理し、書き起こしと議事録を同フォルダ内に保存する。
-    返り値: 議事録ファイルのパス（要約できなかった場合は書き起こしのパス）。
+    返り値: (状態, 成果物のパス)。状態は STATUS_* のいずれか。
 
     途中で中断された場合に備えて、既にできている成果物は作り直さない。
     文字起こしは録音時間の2倍以上かかることがあるため、
@@ -167,11 +189,17 @@ def run(meeting_dir):
 
     transcript_path = os.path.join(meeting_dir, f"{meeting_name}_書き起こし.txt")
     minutes_path = os.path.join(meeting_dir, f"{meeting_name}_議事録.txt")
+    marker_path = os.path.join(meeting_dir, NO_SPEECH_MARKER)
 
     # 既に議事録まで出来ていれば何もしない
     if os.path.exists(minutes_path) and os.path.getsize(minutes_path) > 0:
         print(f"既に議事録があります。処理をスキップします: {minutes_path}")
-        return minutes_path
+        return STATUS_OK, minutes_path
+
+    # 前回「発言なし」と判定済みなら、文字起こしをやり直しても結果は同じ
+    if os.path.exists(marker_path):
+        print(f"この会議は発言が検出されていません（{NO_SPEECH_MARKER} あり）。処理をスキップします。")
+        return STATUS_NO_SPEECH, marker_path
 
     # 1. 書き起こし（既にあれば再利用する＝中断からの再開）
     if os.path.exists(transcript_path) and os.path.getsize(transcript_path) > 0:
@@ -180,23 +208,31 @@ def run(meeting_dir):
         print(f"既存の書き起こしを再利用します（文字起こしはやり直しません）: {transcript_path}")
     else:
         transcript = build_transcript(meeting_dir)
+        if not transcript.strip():
+            # 空の書き起こしを残すと「再開できる」と誤判定されるため、目印だけ置く
+            with open(marker_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "この会議では発言が検出されませんでした。\n"
+                    "ステージチャンネルでスピーカーになっていない可能性があります"
+                    "（聴衆のままだと音声が流れません）。\n"
+                    "このファイルを消すと、次回起動時にもう一度文字起こしを試みます。\n"
+                )
+            print("発言が検出されませんでした。議事録は作成しません。")
+            return STATUS_NO_SPEECH, marker_path
+
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write(transcript)
         print(f"✓ 書き起こしを保存: {transcript_path}")
 
-    if not transcript.strip():
-        print("発言が検出されませんでした。議事録は作成しません。")
-        return transcript_path
-
     # 2. 要約（議事録化）
     summary = summarize_with_gemini(transcript)
     if summary is None:
-        return transcript_path
+        return STATUS_SUMMARY_FAILED, transcript_path
 
     with open(minutes_path, "w", encoding="utf-8") as f:
         f.write(summary)
     print(f"✓ 議事録を保存: {minutes_path}")
-    return minutes_path
+    return STATUS_OK, minutes_path
 
 
 if __name__ == "__main__":
@@ -210,8 +246,10 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        result_path = run(target)
-        # bot 側がパスを拾えるよう、最終行に目印付きで出力
+        status, result_path = run(target)
+        # bot 側が結果を判定できるよう、目印付きで出力する。
+        # 議事録が作れなかった場合も異常終了ではないので終了コードは 0 のまま。
+        print(f"RESULT_STATUS::{status}")
         print(f"RESULT_PATH::{result_path}")
     except Exception as e:
         print(f"エラー: 処理に失敗しました: {e}")

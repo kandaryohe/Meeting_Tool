@@ -33,8 +33,6 @@ Discord 議事録作成bot
 import os
 import sys
 import json
-import wave
-import struct
 import asyncio
 import datetime
 import shutil
@@ -45,6 +43,47 @@ import discord
 from dotenv import load_dotenv
 
 from text_utils import sanitize_filename
+from audio_utils import extract_pcm, write_wav, pcm_duration_seconds
+
+
+# ----------------------------------------------------------------------
+# ログ出力（時刻付き）
+# ----------------------------------------------------------------------
+class _TimestampedStream:
+    """書き込まれた各行の先頭に時刻を付ける出力ストリーム。
+
+    bot はウォッチャーから起動され、出力は bot.out.log にリダイレクトされる。
+    時刻が入っていないと「いつ落ちたのか」「何回起動したのか」を
+    後から追えないため、py-cord 自身が出す行も含めてまとめて時刻を付ける。
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._need_prefix = True
+
+    def write(self, text):
+        if not text:
+            return 0
+        stamp = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
+        out = []
+        for part in text.splitlines(keepends=True):
+            if self._need_prefix:
+                out.append(stamp)
+            out.append(part)
+            self._need_prefix = part.endswith(("\n", "\r"))
+        return self._stream.write("".join(out))
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        # __init__ で _stream を設定済みなので、ここに来るのは他の属性だけ
+        return getattr(object.__getattribute__(self, "_stream"), name)
+
+
+sys.stdout = _TimestampedStream(sys.stdout)
+sys.stderr = _TimestampedStream(sys.stderr)
+
 
 # ----------------------------------------------------------------------
 # 設定の読み込み
@@ -109,6 +148,16 @@ processing: set = set()
 # bot が落ちたあと、どのチャンネルへ結果を返せばよいか復元するために使う。
 META_NAME = "_meeting.json"
 
+# 「発言が検出されなかった会議」に pipeline.py が置く目印。
+# これがある会議は何度やり直しても結果が変わらないので再開の対象から外す。
+# pipeline.py の NO_SPEECH_MARKER と同じ名前にすること。
+NO_SPEECH_MARKER = "_no_speech.txt"
+
+# pipeline.py が返す処理結果（pipeline.py の STATUS_* と対応）
+STATUS_OK = "ok"
+STATUS_NO_SPEECH = "no_speech"
+STATUS_SUMMARY_FAILED = "summary_failed"
+
 # 音声ファイルとして扱う拡張子（未処理判定に使う）
 AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".mp4", ".flac")
 
@@ -139,17 +188,29 @@ def _read_meta(meeting_dir: Path):
 
 
 def _cleanup_old_recordings():
-    """RECORDINGS_RETENTION_DAYS より古い録音フォルダを削除する（容量対策）。"""
-    if RECORDINGS_RETENTION_DAYS <= 0:
-        return
-    cutoff = datetime.datetime.now().timestamp() - RECORDINGS_RETENTION_DAYS * 86400
+    """不要になった録音フォルダを削除する（容量対策）。
+
+    - RECORDINGS_RETENTION_DAYS より古いもの
+    - 中身が空のまま残ったもの（接続に失敗した回などで出来る）
+
+    空フォルダは1時間の猶予を置いてから消す。録音開始直後は
+    メタ情報を書くまでの一瞬だけ空になるため、その巻き添えを避ける。
+    """
+    now = datetime.datetime.now().timestamp()
+    cutoff = now - RECORDINGS_RETENTION_DAYS * 86400
+    empty_cutoff = now - 3600
+
     for entry in REC_DIR.iterdir():
         if not entry.is_dir():
             continue
         try:
-            if entry.stat().st_mtime < cutoff:
+            mtime = entry.stat().st_mtime
+            if RECORDINGS_RETENTION_DAYS > 0 and mtime < cutoff:
                 shutil.rmtree(entry)
                 print(f"古い録音フォルダを削除しました（{RECORDINGS_RETENTION_DAYS}日超過）: {entry.name}")
+            elif not any(entry.iterdir()) and mtime < empty_cutoff:
+                entry.rmdir()
+                print(f"空の録音フォルダを削除しました: {entry.name}")
         except Exception as e:
             print(f"録音フォルダの削除に失敗 ({entry.name}): {e}")
 
@@ -187,36 +248,6 @@ async def _force_disconnect(vc) -> None:
         await vc.disconnect(force=True)
     except Exception as e:
         print(f"切断時のエラー(無視): {e}")
-
-
-def _extract_pcm(raw: bytes):
-    """py-cord が返すバイト列から PCM 本体と音声形式を取り出す。
-
-    py-cord の WaveSink.format_audio は wave.open() でヘッダを書くだけで
-    writeframes を呼ばないため、data チャンクのサイズが 0 の壊れた WAV に
-    なる（RIFFサイズも36のまま）。ffmpeg は寛容なので読めてしまうが、
-    Python の wave モジュールは「0秒」と判定する。
-    そこでヘッダを捨てて PCM だけを取り出し、正しい WAV として書き直す。
-
-    返り値: (PCMバイト列, チャンネル数, サンプル幅バイト, サンプリングレート)
-    """
-    channels, width, rate = 2, 2, 48000  # Opusデコーダの既定値
-
-    if raw[:4] == b"RIFF":
-        i = raw.find(b"fmt ")
-        if i != -1 and len(raw) >= i + 24:
-            try:
-                channels = struct.unpack("<H", raw[i + 10:i + 12])[0] or channels
-                rate = struct.unpack("<I", raw[i + 12:i + 16])[0] or rate
-                bits = struct.unpack("<H", raw[i + 22:i + 24])[0] or 16
-                width = bits // 8
-            except struct.error:
-                pass
-        j = raw.find(b"data")
-        if j != -1:
-            return raw[j + 8:], channels, width, rate
-
-    return raw, channels, width, rate
 
 
 def _explain_voice_error(e: Exception) -> str:
@@ -600,7 +631,7 @@ async def on_recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
         out_path = meeting_dir / f"{sanitize_filename(display)}.wav"
         try:
             audio.file.seek(0)
-            pcm, channels, width, rate = _extract_pcm(audio.file.read())
+            pcm, channels, width, rate = extract_pcm(audio.file.read())
 
             # 中身が無いトラックを渡すと文字起こしが幻聴を起こすので捨てる
             if len(pcm) < MIN_TRACK_BYTES:
@@ -609,13 +640,9 @@ async def on_recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
                 continue
 
             # py-cord の壊れたヘッダを使わず、正しい WAV として書き直す
-            with wave.open(str(out_path), "wb") as wf:
-                wf.setnchannels(channels)
-                wf.setsampwidth(width)
-                wf.setframerate(rate)
-                wf.writeframes(pcm)
+            write_wav(out_path, pcm, channels, width, rate)
 
-            secs = len(pcm) / (rate * channels * width)
+            secs = pcm_duration_seconds(pcm, channels, width, rate)
             print(f"保存: {out_path.name}  ({secs:.1f}秒 / {len(pcm):,}バイト)")
             saved += 1
         except Exception as e:
@@ -653,38 +680,79 @@ async def _process_and_post(meeting_dir: Path, channel) -> None:
     try:
         # 重い処理（torch）は別スレッドのサブプロセスで実行し、bot本体をブロックしない
         loop = asyncio.get_running_loop()
-        returncode, result_path, stderr = await loop.run_in_executor(
+        returncode, status, result_path, stderr = await loop.run_in_executor(
             None, _run_pipeline, meeting_dir
         )
 
-        if returncode == 0 and result_path and os.path.exists(result_path):
-            if channel is not None:
-                try:
-                    await channel.send(
-                        "✅ 議事録が完成しました！",
-                        file=discord.File(result_path),
-                    )
-                except Exception as e:
-                    await channel.send(
-                        f"議事録は作成できましたが、投稿に失敗しました: {e}\n保存先: {result_path}"
-                    )
-            else:
-                print(f"✅ 議事録が完成しました（投稿先不明のためファイルのみ）: {result_path}")
-
-            if DELETE_AUDIO_AFTER_PROCESSING:
-                _delete_audio_files(meeting_dir)
-        else:
+        # pipeline.py は「議事録は作れなかったが異常終了でもない」場合も
+        # 終了コード 0 で返す。成否は status で判断すること。
+        if returncode != 0:
             tail = (stderr or "").strip().splitlines()[-5:]
             detail = "\n".join(tail) if tail else "（詳細不明）"
             print(f"議事録の作成に失敗: {meeting_dir.name} / {detail}")
-            if channel is not None:
-                await channel.send(
-                    "⚠️ 議事録の作成中にエラーが発生しました。\n"
-                    f"保存フォルダ: `{meeting_dir}`\n"
-                    f"エラー概要:\n```\n{detail}\n```"
-                )
+            await _send(
+                channel,
+                "⚠️ 議事録の作成中にエラーが発生しました。\n"
+                f"保存フォルダ: `{meeting_dir}`\n"
+                f"エラー概要:\n```\n{detail}\n```",
+            )
+            return
+
+        if status == STATUS_NO_SPEECH:
+            print(f"発言が検出されませんでした: {meeting_dir.name}")
+            await _send(
+                channel,
+                "⚠️ 録音に発言が見つからなかったため、議事録は作成できませんでした。\n"
+                "ステージチャンネルで**スピーカーになっていたか**確認してください"
+                "（聴衆のままだと音声が流れません）。\n"
+                f"録音データは `{meeting_dir}` に残してあります。",
+            )
+            return
+
+        if status == STATUS_SUMMARY_FAILED:
+            print(f"要約に失敗（書き起こしのみ）: {meeting_dir.name}")
+            await _send(
+                channel,
+                "⚠️ 書き起こしはできましたが、**要約に失敗**しました"
+                "（Gemini の利用上限や混雑が原因のことが多いです）。\n"
+                "書き起こしを添付します。bot を再起動すると、"
+                "文字起こしはやり直さずに要約だけ再実行します。",
+                path=result_path,
+            )
+            return
+
+        if not result_path or not os.path.exists(result_path):
+            print(f"議事録の作成に失敗（成果物が見つかりません）: {meeting_dir.name}")
+            await _send(
+                channel,
+                "⚠️ 議事録の作成は完了しましたが、ファイルが見つかりませんでした。\n"
+                f"保存フォルダ: `{meeting_dir}`",
+            )
+            return
+
+        await _send(channel, "✅ 議事録が完成しました！", path=result_path)
+        if DELETE_AUDIO_AFTER_PROCESSING:
+            _delete_audio_files(meeting_dir)
     finally:
         processing.discard(key)
+
+
+async def _send(channel, text: str, path: str | None = None) -> None:
+    """結果をテキストチャンネルに投稿する。
+
+    投稿先が分からない場合（再開時にメタ情報が無いなど）や、
+    投稿自体に失敗した場合でもログには必ず残す。
+    """
+    if channel is None:
+        print(f"[投稿先不明] {text}" + (f" / {path}" if path else ""))
+        return
+    try:
+        if path:
+            await channel.send(text, file=discord.File(path))
+        else:
+            await channel.send(text)
+    except Exception as e:
+        print(f"Discordへの投稿に失敗: {e} / {text}" + (f" / {path}" if path else ""))
 
 
 async def _resume_unfinished() -> None:
@@ -703,8 +771,13 @@ async def _resume_unfinished() -> None:
         name = d.name
         if (d / f"{name}_議事録.txt").exists():
             continue  # 完成済み
+        if (d / NO_SPEECH_MARKER).exists():
+            continue  # 発言が無かった会議。何度やり直しても結果は同じ
 
-        has_transcript = (d / f"{name}_書き起こし.txt").exists()
+        # 空の書き起こしは「無い」のと同じ扱いにする（pipeline.py と揃える）。
+        # そうしないと、やり直しても必ず失敗する会議を毎回拾ってしまう。
+        transcript = d / f"{name}_書き起こし.txt"
+        has_transcript = transcript.exists() and transcript.stat().st_size > 0
         has_audio = any(p.suffix.lower() in AUDIO_EXTS for p in d.iterdir() if p.is_file())
         if not (has_transcript or has_audio):
             continue  # 素材が無いので何もできない
@@ -722,7 +795,10 @@ async def _resume_unfinished() -> None:
 
 
 def _run_pipeline(meeting_dir: Path):
-    """pipeline.py をサブプロセスで実行し、(returncode, 結果ファイルパス, stderr) を返す。"""
+    """pipeline.py をサブプロセスで実行する。
+
+    返り値: (returncode, 処理結果の状態, 結果ファイルパス, stderr)
+    """
     cmd = PIPELINE_CMD_PREFIX + [str(PIPELINE_PY), str(meeting_dir)]
     print(f"パイプライン実行: {' '.join(cmd)}")
     try:
@@ -735,19 +811,25 @@ def _run_pipeline(meeting_dir: Path):
             cwd=str(BASE_DIR),
         )
     except FileNotFoundError as e:
-        return 1, None, f"パイプライン用の Python が見つかりません: {e}"
+        return 1, None, None, f"パイプライン用の Python が見つかりません: {e}"
 
     print(proc.stdout)
     if proc.stderr:
         print("[pipeline stderr]", proc.stderr)
 
-    # pipeline.py が最終行に出力する RESULT_PATH:: を拾う
-    result_path = None
+    # pipeline.py が出力する RESULT_STATUS:: / RESULT_PATH:: を拾う
+    status, result_path = None, None
     for line in (proc.stdout or "").splitlines():
-        if line.startswith("RESULT_PATH::"):
+        if line.startswith("RESULT_STATUS::"):
+            status = line[len("RESULT_STATUS::"):].strip()
+        elif line.startswith("RESULT_PATH::"):
             result_path = line[len("RESULT_PATH::"):].strip()
 
-    return proc.returncode, result_path, proc.stderr
+    # 状態を出力しない古い pipeline.py に備え、ファイル名から推測する
+    if status is None and result_path:
+        status = STATUS_OK if result_path.endswith("_議事録.txt") else STATUS_SUMMARY_FAILED
+
+    return proc.returncode, status, result_path, proc.stderr
 
 
 if __name__ == "__main__":

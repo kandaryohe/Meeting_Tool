@@ -2,8 +2,7 @@
 """
 Whisper（kotoba-whisper）文字起こしの共通ヘルパー。
 
-run_whisper.py（手動モード）と pipeline.py（Discord bot用）の
-両方から使われる。torch / transformers は関数内で遅延importするため、
+pipeline.py から使われる。torch / transformers は関数内で遅延importするため、
 このモジュール自体は重い依存なしで読み込める（テスト用）。
 """
 
@@ -39,12 +38,6 @@ def load_whisper_pipeline():
         chunk_length_s=30,
         batch_size=8,
     )
-
-
-def transcribe_file(pipe, file_path):
-    """音声ファイル全体をテキストにする（手動モード用）。"""
-    result = pipe(file_path, return_timestamps=True)
-    return result["text"]
 
 
 def transcribe_segments(pipe, file_path):
