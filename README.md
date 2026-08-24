@@ -159,8 +159,32 @@ Discord を使わず、手元の音声ファイルから議事録を作る場合
 2. 左メニュー **Bot** → **Reset Token** でトークンを取得（後で `.env` に貼る）
 3. 左メニュー **OAuth2 → URL Generator**
    - SCOPES: `bot` と `applications.commands`（**両方必須**。欠けるとコマンドを登録できない）
-   - BOT PERMISSIONS: `Connect` / `Speak` / `Use Voice Activity` / `Send Messages` / `Attach Files`
+   - BOT PERMISSIONS: 下表のすべて
    - 生成 URL を開き、**自分のサーバーに招待**
+
+| 権限 | 何に使うか |
+|---|---|
+| View Channel | チャンネルを見る |
+| Send Messages | 議事録の投稿 |
+| Attach Files | 議事録ファイルの添付 |
+| Connect | ボイスチャンネルへの接続 |
+| Speak | ボイス接続の確立 |
+| Use Voice Activity | 音声の受信（録音） |
+| **Manage Channels** | **ステージの自動開始** |
+| **Mute Members** | **参加者へのスピーカー招待・自動昇格** |
+| **Move Members** | **ステージモデレーターとして扱われるために必要** |
+
+**太字の3つを忘れないでください。** これが無いと、ステージの自動開始も
+スピーカーへの招待も失敗し、毎回すべて手作業になります
+（録音自体は動くので気づきにくい）。
+
+URL を手で組み立てる場合は、上記すべてを含む権限値が `57707536` です。
+`APPLICATION_ID` は Developer Portal の **General Information → Application ID**
+で確認できます。
+
+```
+https://discord.com/api/oauth2/authorize?client_id=APPLICATION_ID&permissions=57707536&scope=bot%20applications.commands
+```
 
 > 特権インテント（MESSAGE CONTENT INTENT など）の設定は不要です。
 > bot はスラッシュコマンドとボイス状態しか使いません。
